@@ -46,4 +46,4 @@ source venv/bin/activate
 pip install -r requirements.txt
 python worker.py
 ```
-# VIDE--AI-ENABLED-VIDEO-AND-IMAGE-EDITOR
+# VIDE-AI-ENABLED-VIDEO-AND-IMAGE-EDITOR
