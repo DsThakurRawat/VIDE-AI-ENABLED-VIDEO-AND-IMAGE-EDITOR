@@ -1,49 +1,28 @@
 # VIDE Project Guide
 
 ## Overview
-VIDE is an AI-native creative suite for video and image editing with natural language interface and non-destructive DAG editing.
+VIDE is a blazing-fast, CLI-based AI-native creative suite for video and image editing. It provides a natural language interface to generate non-destructive DAG edits, executing them locally via FFmpeg.
 
 ## Architecture
-- **gateway/**: Go API Gateway (Gin) - JWT auth, PostgreSQL, MinIO, WebSocket, job queue
-- **frontend/**: Next.js 15 + React 19 - timeline editor, command bar, preview
-- **workers/**: Python 3.12 - FFmpeg operations, NLP planner, AI model integration
+- **Language**: Go (Golang) - Single binary distribution, ultra-fast execution.
+- **CLI Framework**: Cobra for command routing.
+- **Terminal UI**: Bubble Tea / Lip Gloss for rich, interactive terminal experiences.
+- **Execution Engine**: Local FFmpeg processes.
+- **Intelligence**: Local/Cloud LLM APIs (OpenAI, Anthropic, Ollama) for NLP-to-DAG planning.
 
 ## Key Commands
 
-### Start infrastructure:
+### Build the CLI:
 ```bash
-docker compose up -d
+go build -o vide main.go
 ```
 
-### Start gateway:
+### Run an edit (Example):
 ```bash
-cd gateway && go run main.go
-```
-
-### Start frontend:
-```bash
-cd frontend && npm run dev
-```
-
-### Start worker:
-```bash
-cd workers && python worker.py
+./vide edit input.mp4 "make it black and white and trim the first 10 seconds"
 ```
 
 ## Code Style
-- Go: stdlib + Gin + GORM, no unused imports
-- TypeScript/React: strict types, no `any`, functional components
-- Python: type hints, f-strings, proper logging
-
-## API Endpoints
-- `GET /api/v1/health` - Health check
-- `POST /api/v1/auth/register` - Register user
-- `POST /api/v1/auth/login` - Login
-- `GET/POST/PATCH/DELETE /api/v1/projects` - Project CRUD
-- `GET/POST/DELETE /api/v1/projects/:id/clips` - Media clips
-- `PUT /api/v1/projects/:id/dag` - Update operation DAG
-- `POST /api/v1/upload/presigned-url` - Get upload URL
-- `POST /api/v1/jobs` - Submit job
-- `GET /api/v1/jobs/:jobId` - Job status
-- `POST /api/v1/nlp/parse` - Parse NL command
-- `WS /ws/jobs/:jobId` - Job progress WebSocket
+- Go: idiomatic Go, minimal external dependencies.
+- No heavy web frameworks, purely local execution.
+- Strict error handling for FFmpeg subprocesses.
