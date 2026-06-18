@@ -1,0 +1,942 @@
+# VIDE — AI-Enabled Video & Image Editor
+## Complete Technical Research, GitHub Ecosystem Analysis & 12-Month Roadmap
+
+> **Author**: Divyansh Rawat | **Date**: March 2026  
+> **Sources**: Claude Sonnet 4.6 architectural deep-dive + live GitHub research  
+> **Purpose**: Permanent reference — explain to teammates, investors, future self
+
+---
+
+## Table of Contents
+1. [What We Are Building](#1-what-we-are-building)
+2. [Full System Architecture](#2-full-system-architecture)
+3. [GitHub Ecosystem — What Exists, What's Broken, What to Steal](#3-github-ecosystem)
+4. [Tech Stack Deep Dive — Every Layer Explained](#4-tech-stack-deep-dive)
+   - 4.1 Language Choices & Why
+   - 4.2 NLP Intent Pipeline
+   - 4.3 Video Processing Stack
+   - 4.4 Image Processing Stack
+   - 4.5 Audio Processing Stack
+   - 4.6 Distributed Job Queue Architecture
+   - 4.7 Storage Architecture
+   - 4.8 Frontend (Web App)
+   - 4.9 Desktop App (Tauri)
+   - 4.10 Infrastructure & GPU Nodes
+5. [Short-Term Challenges (0–6 Months) & Solutions](#5-short-term-challenges)
+6. [Long-Term Challenges (6–36 Months) & Solutions](#6-long-term-challenges)
+7. [Best Practices — Synthesized From the Ecosystem](#7-best-practices)
+8. [12-Month Roadmap](#8-12-month-roadmap)
+9. [Team Composition](#9-team-composition)
+10. [Key GitHub Repos Reference List](#10-key-github-repos)
+
+---
+
+## 1. What We Are Building
+
+VIDE is an **AI-native creative suite** for video and image editing. Unlike every tool that exists today:
+
+| What Exists | What VIDE Does |
+|---|---|
+| ShortGPT — automation only, no user footage editing | Full NL editor for existing media |
+| InstructPix2Pix — poor object isolation, no undo | SAM2 + DAG edit history |
+| Remotion — code-driven, no non-technical users | NL interface over the same engine |
+| VlMax — generation only | Editing + generation in one tool |
+| twick/editly — API/SDK, no UX | Build the product layer |
+
+**The three unique things NO competitor does together:**
+1. A **natural language interface** (text → structured edit plan → execution graph → media output)
+2. Editing of the **user's own footage** — not AI-generated content from scratch
+3. A fully **non-destructive edit history** — every operation is a DAG node, rewindable, branchable
+
+**The long-vision north star**: A filmmaker types intent in plain language. The system proposes a complete edit plan, executes it as a non-destructive operation graph, lets the filmmaker adjust at any level of abstraction, and exports professional-grade output with proper codecs, audio normalization and color management.
+
+---
+
+## 2. Full System Architecture
+
+```mermaid
+graph TB
+    subgraph CLIENT["CLIENT LAYER"]
+        WEB["Web App\nReact 19 + Next.js 15"]
+        DESKTOP["Desktop App\nTauri 2.0 (Win/Mac/Linux)"]
+        CLI["CLI Tool\nRust Binary"]
+        SDK["SDK / API\nPython + JS Clients"]
+    end
+
+    subgraph GATEWAY["GATEWAY LAYER"]
+        GW["API Gateway\nGo 1.22 + Gin/Kong\nJWT Auth, Rate Limiting"]
+        NLP["NLP Intent Router\nParse → Dispatch Command"]
+        JQ["Job Queue\nRedis + BullMQ / Kafka"]
+    end
+
+    subgraph AICORE["AI CORE LAYER"]
+        LLM["LLM Planner\nGPT-4o / Gemini / llama.cpp local"]
+        VIS["Vision Models\nCLIP + SAM2 + Florence-2"]
+        AUD["Audio Models\nWhisper + DeepFilterNet + MusicGen"]
+    end
+
+    subgraph WORKERS["WORKER PODS (Python, GPU-backed)"]
+        VW["Video Worker\nFFmpeg + PySceneDetect + CLIP"]
+        IW["Image Worker\nPillow + OpenCV + rembg + LaMa + Real-ESRGAN"]
+        AW["Audio Worker\nlibrosa + pedalboard + DeepFilterNet"]
+        EXP["Export Worker\nFFmpeg render + CDN upload"]
+    end
+
+    subgraph STORAGE["STORAGE LAYER"]
+        OBJ["Object Store\nMinIO / S3 (raw + proxy media)"]
+        DB["Database\nPostgreSQL (metadata, projects, users)"]
+        CACHE["Cache + Queue State\nRedis"]
+        VDB["Vector DB\nQdrant (semantic search + clip embeddings)"]
+    end
+
+    CLIENT --> GATEWAY
+    GATEWAY --> AICORE
+    GATEWAY --> WORKERS
+    WORKERS --> STORAGE
+    AICORE --> JQ
+    JQ --> WORKERS
+```
+
+### Architecture Principles
+- **Proxy Editing Always**: Store 480p proxy, edit at low res, export from full-res original. This is how Premiere Pro and DaVinci Resolve work.
+- **Non-Destructive DAG**: Every operation is a node in a DAG. Nothing mutates the original. Edit history is infinitely rewindable.
+- **Stateless Workers**: Worker pods are horizontally scalable. Job state lives in Redis, not in the worker.
+- **Keyframe Anchoring**: For temporal consistency in AI edits, edits are anchored to keyframes and interpolated across frames — reducing visible flicker.
+
+---
+
+## 3. GitHub Ecosystem — What Exists, What's Broken, What to Steal
+
+### 3.1 ShortGPT (`RayVentura/ShortGPT`)
+**What it is**: Framework for automating *creation* of short-form video content. It uses LLM + Editing Markup Language + JSON to produce automated YouTube Shorts/TikToks.
+
+**What it does well**:
+- JSON/EML-based operation schema (steal this concept)
+- Automated engines: `ContentShortEngine`, `ContentVideoEngine`, `ContentTranslationEngine`
+- ElevenLabs voice synthesis integration
+- TinyDB for persistence of automated editing variables
+
+**What's broken**:
+- Completely cloud-dependent, no local inference
+- Can only generate content *from scratch*, cannot edit user's own footage
+- No undo system, no DAG. If it fails, you restart.
+- No non-technical user interface — requires API keys and Python knowledge
+- No object isolation (can't say "blur face of person on the left")
+
+**What to steal**: 
+> ✅ The JSON operation schema idea — a registry of ~200 named edit operations that map to structured JSON commands. This is the correct architecture for the NLP layer.
+
+---
+
+### 3.2 InstructPix2Pix (`timothybrooks/instruct-pix2pix`) + Grounded variant (`arthur-71/Grounded-Instruct-Pix2Pix`)
+
+**What it is**: Image editing from written instructions. Two-conditioning diffusion model (image + text instruction → edited image). Doesn't require per-example fine-tuning.
+
+**How it works**:
+- Combines a language model (GPT-3/GPT-4) + Stable Diffusion
+- Generates a large paired dataset (original image, instruction, edited image) then trains on it
+- At inference: takes `(image, instruction)` and outputs `edited_image` in seconds
+
+**Grounded variant adds**:
+- CLIP-Score Filtering to extract noun phrases from instruction → find editing target
+- Grounded-SAM to generate a precise segmentation mask of target
+- Latent blending — only the masked area changes, preserving the rest of the image
+
+**What's broken**:
+- Forward pass model — it generates new pixels, doesn't track what changed
+- Known failure modes: can't change viewpoints, struggles with object swap/reorganize
+- No temporal consistency — apply it 500 frames → flickering artifact
+- No undo history — the edit is baked in
+
+**What to steal**:
+> ✅ The two-stage pipeline: **Ground (isolate target with SAM2) → Edit (apply instruction to masked region)**. This is exactly the right architecture for your Image Worker.
+> ✅ Latent blending for masked edits — ensures the unedited region remains pixel-perfect.
+
+---
+
+### 3.3 AnyV2V (`TIGER-AI-Lab/AnyV2V`)
+
+**What it is**: A tuning-free framework for temporal consistency in video editing. Published at TMLR 2024.
+
+**How it works** (two steps):
+1. Edit the **first frame** of the video using any image editor (InstructPix2Pix, Grounded-IP2P, etc.)
+2. Use an image-to-video (I2V) model with **temporal feature injection** to propagate the edit to all remaining frames
+
+**Why temporal consistency matters**:
+- Naive frame-by-frame editing → flickering between frames (character changes shirt color slightly every frame)
+- AnyV2V's anchor approach locks visual appearance from frame 1, then the temporal diffusion ensures coherent continuation
+
+**Related work to also study**:
+- **AnchorSync (2025)**: Explicit "sparse anchor frame editing" + smooth interpolation for *long* videos (1000s of frames)
+- **VALA (2025)**: Variational alignment with semantic anchors compressed from keyframe latents
+
+**What to steal**:
+> ✅ First-frame-as-anchor paradigm for all AI-style-transfer features  
+> ✅ Cache your edited keyframes. Only run expensive AI on keyframes, interpolate between them  
+> ✅ This is your solution to the "temporal consistency" long-term challenge
+
+---
+
+### 3.4 Meta SAM2 (`facebookresearch/segment-anything-2`)
+
+**What it is**: Unified model for image AND video segmentation. Real-time object tracking across video frames. Released July 2024.
+
+**How it works**:
+- Streaming memory architecture: processes frames sequentially, maintains context across frames
+- User provides a prompt (point click, bounding box, or mask) on any frame
+- SAM2 tracks the object through the entire video in real-time
+- Supports multi-object tracking
+
+**Extensions**:
+- **SAM2Long** (GitHub): Enhanced SAM2 for long-video segmentation (reduces error accumulation)
+
+**Why it's your most important dependency**:
+> Every "isolate this object" or "apply effect to this person" feature depends on SAM2. Without object isolation, you can't do:
+> - "Blur the face on the left"
+> - "Change shirt color to red"
+> - "Remove the car in the background"
+> - "Apply color grade only to the sky"
+
+**Integration pattern**:
+```python
+# User clicks on "the car" in frame 50
+# SAM2 tracks the car through frames 1-500
+# Returns per-frame binary masks → compositing layer
+
+sam2_predictor.set_video(video_path)
+masks, _, _ = sam2_predictor.predict_video(
+    frame_idx=50,
+    point_coords=[[x, y]],  # user click
+    point_labels=[1],
+    track_backward=True
+)
+# Now apply any operation only within `masks`
+```
+
+---
+
+### 3.5 Remotion (`remotion-dev/remotion`)
+
+**What it is**: React-based SDK for creating videos programmatically. Use CSS/Canvas/SVG/WebGL/React to define video structure. FFmpeg renders it server-side.
+
+**Architecture**: react component tree → renders to frames via headless browser → FFmpeg rebundles → video
+
+**Limitations (critical for VIDE)**:
+- Code-first: no built-in visual timeline, no drag and drop
+- No non-technical users — requires React programming knowledge
+- Client-side rendering is experimental, WebCodecs only (Chrome 94+, Firefox 130+, Safari 26+)
+- No real-time editing hooks for AI model integration
+- Browser throttles `requestAnimationFrame` when tab is backgrounded
+- Cross-platform compilation not possible — Tauri relies heavily on native toolchains
+
+**What to steal**:
+> ✅ The React component model for your timeline editor frontend — video as a declarative React tree with time as a prop
+> ✅ WebCodecs for in-browser preview rendering (fast, no FFmpeg on client)
+
+---
+
+### 3.6 editly (`mifi/editly`) + twick (AI video editor SDK)
+
+**editly**: Declarative video editing API — define a JSON spec → editly outputs a video. Server-side export via FFmpeg. No UX layer.
+
+**twick**: React-based video editor SDK with canvas timeline, drag-and-drop, AI captions (Google Vertex AI), serverless MP4 export.
+
+**Critical constraint in both**:
+- Export is constrained to client RAM/CPU/GPU — browser export crashes on large files
+- WebCodecs is Chromium-only → Firefox and Safari must use server-side FFmpeg
+- In-browser preview is limited, full-res export must go server-side
+
+**What to steal**:
+> ✅ Server-side export-over-API pattern: Web app sends all job details to server FFmpeg worker, stream progress back via WebSocket
+> ✅ JSON declarative spec format for the entire edit timeline
+
+---
+
+### 3.7 DeepFilterNet (`rikorose/DeepFilterNet`)
+
+**What it is**: Real-time speech enhancement / noise removal. Full-band audio at 48kHz. Latency: 10–20ms.
+
+**Python integration**: `pip install deepfilternet`, `PyDF` Python wrapper for STFT/ISTFT loop.
+
+**Why it matters**: Every user video has background noise. DeepFilterNet is production-ready, one-line Python to run. No GPU needed for inference on CPU. GPU makes it ~5x faster.
+
+**Integration**:
+```python
+from df.enhance import enhance, init_df, load_audio, save_audio
+
+model, df_state, _ = init_df()
+audio, sr = load_audio("input.wav", sr=df_state.sr())
+enhanced = enhance(model, df_state, audio)
+save_audio("output.wav", enhanced, df_state.sr())
+```
+
+> ✅ Steal: Run this on every user-uploaded video automatically as a pre-processing step
+
+---
+
+### 3.8 Real-ESRGAN (`xinntao/Real-ESRGAN`)
+
+**What it is**: AI super-resolution model. Upscales images/videos 2x or 4x with high quality. Particularly good at restoring details in degraded footage.
+
+**How it works**:
+1. Extract all frames with FFmpeg
+2. Run Real-ESRGAN on each frame (batched, GPU-accelerated with half-precision fp16)
+3. Reassemble with FFmpeg + RIFE for temporal consistency
+
+**Models**:
+- `RealESRGAN_x4plus` — general photos/footage
+- `realesr-animevideov3` — anime/illustration content
+- `ncnn-vulkan` variant — runs on any GPU (NVIDIA/AMD/Intel/Mac M-series)
+
+**Production note**: A 720p → 4K upscale is ~4x processing. For a 2-minute clip at 60fps = 7200 frames. Each frame takes ~100ms on RTX 3090 → ~12 min total. **This must be a background job, never synchronous**.
+
+> ✅ Steal: The frame extraction → batch process → reassemble pipeline with RIFE temporal consistency
+
+---
+
+### 3.9 LaMa Inpainting + rembg
+
+**LaMa (`advimman/lama`)**: Large Mask Inpainting using Fast Fourier Convolutions. Fills in missing regions or removes objects with ambient context preservation.
+
+**rembg (`danielgatis/rembg`)**: Background removal using machine learning. Handles hair, semi-transparent objects. CUDA/ROCm GPU support.
+
+**Combined Pipeline for "Remove Object from Video"**:
+```
+User: "Remove the lamp in the background"
+→ SAM2 generates per-frame masks of the lamp
+→ LaMa inpaints each frame where the mask is active
+→ FFmpeg reassembles the processed frames
+→ Temporal consistency pass (RIFE interpolation on non-keyframes)
+```
+
+> ✅ `rembg` for background removal in image editor  
+> ✅ `LaMa` for object removal / inpainting in both image and video  
+> ✅ This combination is your "erase" tool
+
+---
+
+## 4. Tech Stack Deep Dive — Every Layer Explained
+
+### 4.1 Language Choices & Why
+
+| Layer | Language | Reason |
+|---|---|---|
+| API Gateway | **Go 1.22** | Single binary, 50k+ concurrent connections via goroutines, native HTTP/2 + gRPC, fast auth/rate-limiting/routing |
+| AI Workers | **Python 3.12** | PyTorch, OpenCV, FFmpeg-python, librosa, SAM2, CLIP — the entire AI/ML stack is Python-native, no competition |
+| Desktop Shell | **Rust** | Zero-copy memory model (no expensive copies when processing large video frames), sub-15MB app bundle, Tauri native bindings |
+| Frontend | **TypeScript + React 19** | Complex timeline editor, drag-and-drop, WebSocket live preview, TanStack Query for server state |
+| Web Framework | **Next.js 15** | SSR for marketing + app shell, React Server Components, API routes |
+
+**Why NOT wasm for video**: WASM is sandboxed — no filesystem access, no GPU (yet), no native codec support. Complex video processing must happen server-side.
+
+**Why NOT Electron for desktop**: 150MB+ bundle, duplicate Chromium, high memory. Tauri uses system WebView2 (Windows) / WebKitGTK (Linux) + Rust backend = <15MB bundle.
+
+---
+
+### 4.2 NLP Intent Pipeline
+
+This is the **core innovation** of the product. When a user types "cut the first 10 seconds, add a fade, boost the bass slightly, and export at 1080p", the system must convert this into a structured execution graph.
+
+#### Two-Stage Pipeline
+
+**Stage 1: LLM Planner** (GPT-4o / Gemini / local Mistral 7B or LLaMA 3.1 8B)
+- Input: raw user text + current timeline context (metadata about the loaded video)
+- Output: structured JSON operation graph
+
+**Stage 2: Validator + Executor**
+- Validate the JSON against the operation schema
+- Run a dry-run (validate all parameters are in range, clips exist, etc.)
+- Show the user a natural language confirmation: "I'm going to: [trim 0–3s] [add fade] [boost saturation 15%]"
+- Wait for user approval
+- Execute the DAG
+
+#### Operation Schema JSON Format
+
+```json
+{
+  "plan_id": "plan_20260319_001",
+  "operations": [
+    {
+      "op": "trim",
+      "start": 0,
+      "end": 10,
+      "action": "remove"
+    },
+    {
+      "op": "transition",
+      "type": "fade",
+      "target": "cut_point",
+      "duration_ms": 500
+    },
+    {
+      "op": "audio_eq",
+      "band": "bass",
+      "gain_db": 3
+    },
+    {
+      "op": "export",
+      "resolution": "1080p",
+      "codec": "h264",
+      "crf": 18
+    }
+  ]
+}
+```
+
+#### Operation Registry (~200 Named Operations)
+
+The LLM is prompted with the full schema. For ambiguous commands, the system asks for clarification before executing. You never train the LLM from scratch — you prompt-engineer a planning layer on top of existing models.
+
+**Example categories**:
+- `trim`, `split`, `merge`, `loop` — clip operations
+- `fade_in`, `fade_out`, `crossfade`, `dissolve` — transitions
+- `color_grade`, `lut_apply`, `saturation`, `brightness`, `contrast` — color
+- `denoise_audio`, `eq_bass`, `eq_treble`, `normalize_loudness` — audio
+- `remove_background`, `remove_object`, `inpaint`, `style_transfer` — AI operations
+- `upscale`, `slow_motion`, `speed_ramp`, `stabilize` — video AI
+- `export`, `preview`, `thumbnail` — output operations
+
+#### Local/Offline Support
+
+For privacy-sensitive users and enterprise clients:
+- Quantized **Mistral 7B** or **LLaMA 3.1 8B** via `llama.cpp` (4-bit quantization)
+- Runs on consumer GPUs with 8GB VRAM
+- Smaller distilled versions of SAM2 and CLIP for device-side vision inference
+- This is a 6-month engineering effort to get right
+
+---
+
+### 4.3 Video Processing Stack
+
+```mermaid
+graph LR
+    RAW["Raw Input\nVideo File"] --> DEMUX["Demux\nFFmpeg split\nvideo + audio streams"]
+    DEMUX --> VOP["Video Ops\ncut/trim/splice\ncolor grade LUT\ntransitions/effects"]
+    DEMUX --> AOP["Audio Ops\nnoise removal\nEQ/level/FX\nsound effects"]
+    AI["AI Models\nSAM2 objects\nCLIP scenes"] --> VOP
+    VOP --> MUX["Mux + Export\nH.264 / H.265 / AV1\nAAC / FLAC audio"]
+    AOP --> MUX
+```
+
+**FFmpeg** is the universal foundation — handles virtually every container format and codec. Your Python video worker calls FFmpeg via subprocess or the `ffmpeg-python` library.
+
+**GPU Acceleration**:
+- NVIDIA: `NVENC` for encoding, `NVDEC` for decoding (zero-copy via CUDA)
+- AMD: `AMF` encoder
+- Intel: `QuickSync`
+- Linux: `VA-API` for hardware-accelerated decode/encode
+- Apple Silicon: `VideoToolbox`
+
+**AI-Powered Video Features**:
+
+| Feature | Model | How |
+|---|---|---|
+| Scene detection + auto-cut | PySceneDetect + CLIP embeddings | Content-aware scene boundary detection; cluster similar scenes |
+| Object tracking + masking | SAM2 | Track objects through video frames via streaming memory |
+| Automatic B-roll placement | CLIP embeddings on transcript | Find semantically relevant clips from library at the right moment |
+| Color grading | LUT model trained on cinematography datasets | Convert "make it look 70s film" → LUT → FFmpeg LUT filter |
+| Slow motion / Frame interpolation | RIFE (Real-time Intermediate Flow Estimation) | Generate intermediate frames between existing frames |
+| Video upscaling | Real-ESRGAN | Frame-by-frame upscale with temporal consistency module |
+| Video stabilization | OpenCV + vidstab | Optical flow-based stabilization |
+
+---
+
+### 4.4 Image Processing Stack
+
+**Layered approach**:
+1. **Pillow** — basic operations (crop, resize, rotate, format conversion)
+2. **OpenCV** — complex CV (inpainting, edge detection, perspective correction, object detection, contour finding)
+3. **AI models** — for features requiring understanding:
+   - **rembg** — background removal (one-line Python, GPU-accelerated)
+   - **LaMa** — inpainting / object removal (Fast Fourier Convolutions, production-ready ~2s on T4 GPU)
+   - **Real-ESRGAN** — 2x/4x super resolution without quality loss
+   - **AdaIN / DiffStyle** — style transfer
+   - **SAM2** — object segmentation (with masking → enables selective editing)
+
+**Non-Destructive Principle**: Every operation generates a new layer or a transform node in the DAG, never modifying the original pixels. The edit history is THIS DAG, which can be rewound, branched, or replayed.
+
+**GDPR / Privacy Consideration**: Images and video are processed without being stored permanently when the user opts into ephemeral processing. Delete media after job completes.
+
+---
+
+### 4.5 Audio Processing Stack
+
+| Use Case | Library | Notes |
+|---|---|---|
+| BPM detection, beat tracking, silence detection | **librosa** | Industry standard audio analysis in Python |
+| Professional audio effects (reverb, compression, EQ, pitch shifting) | **pedalboard** (Spotify) | Production-grade, wraps VST3/AU plugins |
+| Noise removal, speech enhancement | **DeepFilterNet** | Real-time, 10–20ms latency, 48kHz full-band |
+| Background noise removal (RNNoise alternative) | **DeepFilterNet** | Also works via LADSPA plugin on Linux |
+| Music generation for background tracks | **MusicGen** (Meta) | Text-to-music generation |
+| Sound effects retrieval | **AudioLDM2** | Text-to-audio generation for sound effects |
+| Speech recognition (for subtitle/transcript) | **Whisper** (OpenAI) | Best-in-class multilingual ASR |
+| Loudness normalization | **pyloudnorm** | EBU R128 standard for broadcast/streaming |
+
+**Audio Pipeline**:
+```
+User video → FFmpeg extract audio → DeepFilterNet denoise →
+librosa analyze (BPM/beats) → pedalboard effects chain →
+pyloudnorm normalize → FFmpeg re-embed into video
+```
+
+---
+
+### 4.6 Distributed Job Queue Architecture
+
+#### Why a job queue?
+GPU inference is expensive. A single "remove background from this 2-minute video" job using SAM2 frame-by-frame costs real money. You need:
+- **Batch queuing**: Multiple users' jobs shouldn't block each other
+- **Tiered processing**: Cheap model for preview → expensive model for export
+- **Result caching**: Same clip + operation → cached result (saves GPU cost)
+- **Worker crash safety**: Job state persists in Redis even if worker dies
+
+```mermaid
+graph TB
+    API["API Gateway\n(Go)"] --> Q["BullMQ Queues\n(Redis-backed)"]
+    Q --> |"preview jobs"| WP1["Preview Workers\n(cheap models, fast)"]
+    Q --> |"export jobs"| WP2["Export Workers\n(expensive models, slow)"]
+    Q --> |"AI jobs"| WP3["AI Workers\n(GPU pods)"]
+    WP1 --> WS["WebSocket\n(stream progress)"]
+    WP2 --> S3["MinIO / S3\n(output files)"]
+    WP3 --> CACHE["Redis Cache\n(result caching)"]
+    WS --> CLIENT["Client App"]
+```
+
+#### Queue Types
+
+| Queue | Purpose | Workers | Model Tier |
+|---|---|---|---|
+| `preview` | 480p low-latency previews for timeline scrubbing | 10+ lightweight | Fast, cheap |
+| `ai-operations` | SAM2 segmentation, DeepFilterNet, LaMa | 2–5 GPU workers | Expensive |
+| `export` | Full-res FFmpeg render, Codec encode | 3–6 CPU workers | CPU-heavy |
+| `audio` | DeepFilterNet, Whisper transcription | 2–4 CPU/GPU | Medium |
+
+#### BullMQ vs Kafka
+
+| | BullMQ (Redis) | Kafka |
+|---|---|---|
+| Use for | Standard job management, retry, priority, rate-limiting | Large-scale event streaming, audit log, replay |
+| Latency | Low (ms) | Higher (batch-oriented) |
+| Persistence | Redis AOF/RDB | Log-based, infinite retention |
+| Language support | Node.js + Python natively | All languages via client libs |
+| When to use | Start here. 95% of use cases. | When you need event replay, fan-out to multiple consumers, 10k+ jobs/sec |
+
+**Start with BullMQ. Add Kafka later for event streaming (audit log of all edits, stream to analytics).**
+
+---
+
+### 4.7 Storage Architecture
+
+| Store | Technology | What's Stored |
+|---|---|---|
+| Raw + Proxy Media | **MinIO / S3** | Original uploads (never mutated), 480p proxies, rendered exports |
+| Metadata + Users + Projects | **PostgreSQL** | User accounts, project records, operation DAGs (as JSON), edit history |
+| Cache + Sessions + Queue State | **Redis** | Job states, auth tokens, result cache (TTL-based) |
+| Vector Embeddings | **Qdrant** | CLIP embeddings of all clips for semantic search ("find clip with sunset") |
+
+#### Media Lifecycle
+```
+Upload → S3 (raw) → Generate proxy (480p) → S3 (proxy)
+Edit → Operations stored in PostgreSQL (DAG) — never touch raw
+Export → Read raw from S3 → Apply DAG operations → Render → S3 (output)
+```
+
+#### Why Qdrant (Vector DB)?
+- Semantic search across footage library: "show me all clips with people laughing"
+- B-roll suggestion: transcript text → embed → find matching clips via cosine similarity
+- Style matching: embed reference image → find visually similar clips
+
+---
+
+### 4.8 Frontend — Web App
+
+**Stack**: React 19 + Next.js 15 + TypeScript + Tailwind CSS + Zustand + TanStack Query + React DnD Kit
+
+**Key UI Components**:
+1. **Timeline Editor** — drag-and-drop clips, multi-track audio/video, frame scrubbing
+2. **NL Command Bar** — text input → shows AI-parsed plan → confirm → execute
+3. **Properties Panel** — shows current operation parameters, adjustable sliders
+4. **Preview Window** — WebSocket-driven real-time low-res preview
+5. **Edit History** — visual DAG tree, undo/redo, branch from any point
+
+**Real-time Preview Architecture**:
+```
+User scrubs timeline
+→ React sends WebSocket message: { clip_id, timestamp, operations[] }
+→ Go gateway routes to a preview worker
+→ Worker renders 480p proxy frame (fast)
+→ Streams JPEG frame back via WebSocket
+→ React displays in preview window
+```
+
+**Why TanStack Query**: Server state management for all API calls (project data, job status polling, operation results). Handles caching, background refetching, optimistic updates.
+
+**Why React DnD Kit**: Modern, performance-oriented drag-and-drop for the timeline. The legacy `react-beautiful-dnd` is deprecated.
+
+**E2E Encryption Option**: For enterprise clients, encrypt project data client-side before sending to server. Server stores encrypted blobs. Client decrypts locally. This handles GDPR.
+
+---
+
+### 4.9 Desktop App — Tauri 2.0
+
+**Why Tauri over Electron**:
+- Electron: ships its own Chromium (150MB+), Node.js, high memory usage
+- Tauri: uses system WebView (WebView2 on Windows, WebKitGTK on Linux, WebKit on macOS), Rust backend → <15MB bundle
+
+**Architecture**:
+```
+Web frontend (React — shared codebase with web app)
+     ↕ Tauri IPC (invoke/emit)
+Rust backend (handles:)
+  - Local file system access (read/write video files directly)
+  - FFmpeg subprocess management
+  - Local AI inference (llama.cpp, SAM2 small, CLIP small)
+  - Native OS notifications, tray, auto-update
+  - Hardware detection (GPU, RAM, available VRAM)
+```
+
+**Offline Mode**:
+- Local LLaMA 3.1 8B (4-bit quantized via llama.cpp) for NLP planning
+- Local SAM2-small for object segmentation
+- Local DeepFilterNet for audio denoising
+- Local FFmpeg for all video/audio processing
+- Cloud sync optional — upload to server for heavy AI features
+
+**Cross-Platform Build Pipeline** (non-negotiable from day 1):
+```yaml
+# GitHub Actions — must build all 3 platforms
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps: [tauri build]
+  build-macos:
+    runs-on: macos-latest  # Apple Silicon
+    steps: [tauri build, codesign]
+  build-linux:
+    runs-on: ubuntu-latest
+    steps: [tauri build, appimage]
+```
+
+---
+
+### 4.10 Infrastructure & GPU Nodes
+
+**Cloud Deployment**: Web app + API deploy to any cloud (AWS, GCP, self-hosted). Docker containers, orchestrated with Kubernetes.
+
+**GPU Node Options**:
+| GPU | VRAM | Best For | Cost (est.) |
+|---|---|---|---|
+| NVIDIA A10G | 24GB | SAM2, LaMa, Real-ESRGAN | ~$0.75/hr |
+| NVIDIA A100 (40GB) | 40GB | Large model inference, batch export | ~$2.50/hr |
+| NVIDIA L4 | 24GB | Cost-efficient inference | ~$0.54/hr |
+| AMD MI300X | 192GB | HPC workloads | ~$3.50/hr |
+
+**GPU Cost Optimization**:
+- **Result caching**: Same clip + same operation = cached. Saves 40–60% GPU cost in practice.
+- **Tiered processing**: Always run on cheapest model that achieves acceptable quality for preview. Only use expensive model on final export.
+- **Spot instances**: Use AWS Spot / GCP Preemptible for batch export jobs (70% cheaper; must handle preemption gracefully by checkpointing job state in Redis).
+
+**Monitoring Stack**: Prometheus + Grafana for metrics. GPU utilization, job queue depth, worker health, latency percentiles.
+
+---
+
+## 5. Short-Term Challenges (0–6 Months) & Solutions
+
+### 5.1 NLP Command Ambiguity ⚠️ HARDEST PROBLEM
+**Problem**: "Make it cinematic", "clean up the audio", "fix the colors" are meaningless without a disambiguation layer. Every existing tool either ignores this or punts to the user with a form.
+
+**Solution**:
+1. **Confirmation before execute**: System parses command → generates natural-language plan → shows user "I'm going to: [trim 0–3s] [add fade] [boost saturation 15%]" → waits for approval
+2. **Ambiguity detection**: If the LLM confidence is < threshold, ask a clarifying question ("Do you mean the bass in the background music, or the voiceover?")
+3. **Operation schema validation**: All generated JSON validates against the ~200-operation schema. Invalid operations → ask for clarification, never execute blindly
+4. **This gives you a natural undo model**: The user approved the plan. If the result isn't what they wanted, they can see exactly what ran and revert it.
+
+### 5.2 GPU Cost Per Request
+**Problem**: A single "remove background from this 2-minute video" job using SAM2 frame-by-frame costs real money. At scale, this compounds fast.
+
+**Solution**:
+1. **Batch queuing**: Never process a request immediately if a similar one is queued. Batch similar operations
+2. **Result caching**: `hash(clip_id + operation_params)` → check Redis before running inference. Cache results with TTL
+3. **Tiered processing**: Low-res/cheap model for preview (instant), expensive model only on export button press
+4. **Spot instances**: 70% cheaper. Handle preemption via job checkpointing in Redis
+5. **Model distillation**: Where possible, fine-tune smaller versions of models for your most frequent operations
+
+### 5.3 Large File Latency
+**Problem**: A 10GB 4K video file takes minutes to upload, and processing takes even longer. This is a UX killer.
+
+**Solution** (industry standard):
+1. **Proxy editing**: Immediately generate 480p proxy on upload (cheap). Show editing UI using proxy. Only access full-res on final export. This is how Premiere Pro works.
+2. **Chunked upload**: Upload video in chunks (uppy.js or tus protocol). Resumable, parallel chunk upload.
+3. **Progressive loading**: Start showing timeline scrubbing while video is still uploading (stream from partially uploaded file)
+4. **Smart caching**: Cache rendered preview frames by timestamp. Scrubbing the same point twice = instant the second time.
+
+### 5.4 Cross-Platform Desktop Build Pipeline
+**Problem**: Tauri relies heavily on native libraries and toolchains. Meaningful cross-compilation is not possible — you must have 3 separate CI runners.
+
+**Solution**:
+1. GitHub Actions with 3 build runners: Windows (windows-latest), macOS Apple Silicon (macos-latest), Linux (ubuntu-latest)
+2. All 3 runners from day 1 — adding a runner later after codebase grows is extremely painful (native library incompatibilities compound)
+3. Code signing from day 1: Apple notarization + Microsoft EV cert
+4. Single shared React codebase between web and desktop (Tauri just wraps it)
+
+### 5.5 Browser Export Compatibility
+**Problem**: WebCodecs (for in-browser video encoding) is Chromium-only. Firefox and Safari must use server-side FFmpeg.
+
+**Solution**:
+- In-browser preview: WebCodecs + Mediabunny (fast, Chromium only)
+- Export: Always route to server-side FFmpeg worker, regardless of browser  
+- Never let the frontend generate the final export. Frontend is for preview only.
+
+---
+
+## 6. Long-Term Challenges (6–36 Months) & Solutions
+
+### 6.1 Temporal Consistency in AI Video Edits
+**Problem**: AI style transfer or object manipulation across 300–500 frames creates flickering — subtle differences between frames that look deeply wrong.
+
+**Solutions**:
+1. **AnyV2V paradigm**: Edit first frame → I2V model with temporal injection propagates edits
+2. **Keyframe anchoring**: Run expensive AI only on keyframes (every 30th frame), RIFE interpolate intermediate frames
+3. **AnchorSync approach** (2025 research): For long videos (1000+ frames), sparse anchor frame editing + smooth interpolation
+4. **Optical flow consistency**: Use optical flow between frames to warp the previous edit result to the next frame — much cheaper than running full model again
+
+### 6.2 Offline & Local AI Inference
+**Problem**: Privacy-conscious users and enterprise clients cannot upload footage to cloud servers. GPU cost also becomes a problem at scale.
+
+**Solution Timeline**:
+- Month 6–9: llama.cpp for local NLP planner (Mistral 7B, 4-bit, 8GB VRAM)
+- Month 9–12: SAM2-small distilled model for local object segmentation
+- Month 12–18: Distilled CLIP for local semantic search
+- Month 18+: Custom quantized models for device inference on Apple Silicon (Core ML), NVIDIA (TensorRT), AMD (ROCm)
+
+**Toolchain**: llama.cpp (C++ backend, Python bindings), `ctransformers` for easy Python model loading, ONNX Runtime for cross-hardware model export
+
+### 6.3 Data Privacy & GDPR Compliance
+**Problem**: As soon as European users upload personal video footage (containing faces = biometric data), you're handling regulated data.
+
+**Architecture Responses**:
+1. **Ephemeral processing**: All media is deleted from server after job completes (configurable TTL, default 24h)
+2. **E2E encryption option**: Enterprise tier — client encrypts footage before upload, server stores encrypted blobs, client decrypts results
+3. **On-device processing**: Desktop app with local AI means footage never leaves user's computer
+4. **GDPR data controls**: Export all project data, delete all data — user-accessible controls in settings
+5. **Audit log**: Every operation logged with timestamp, user ID, operation type. Never log raw media content.
+
+### 6.4 Real-Time Collaboration
+**Problem**: Think Google Docs for video — two users trimming the same clip in different ways cannot be trivially merged. Timeline edits are inherently non-commutative.
+
+**Research Direction**:
+- CRDTs work for text but timeline edits need significant adaptation (non-commutative operations)
+- **Operational Transform (OT)** for video: transform an operation against another to resolve conflicts. Existing academic work exists but is not production-ready.
+- **Short-term pragmatic solution**: Lock-based editing. One user edits at a time. Others can comment.
+- **Long-term**: Custom CRDT for timeline data structures — this is a research problem, not just engineering.
+
+### 6.5 Model Version Drift
+**Problem**: Every time an upstream model (SAM2, CLIP, GPT-4o) releases a new version, your carefully tuned prompts and operation schemas may break or produce different outputs.
+
+**Solution**:
+1. **Model version pinning**: Lock exact model versions in all worker containers (`SAM2-hiera-large-v1.0`, not `SAM2-latest`)
+2. **Regression test suite**: Golden set of 100 reference outputs (clips + operations → expected outputs). Run on every model upgrade. SSIM + VMAF metrics for video quality.
+3. **Shadow model testing**: Run new model version in parallel (on 5% of traffic) before full rollout. Compare outputs statistically.
+4. **Prompt versioning**: Store all LLM prompts in version-controlled config files, separate from code. Prompt changes go through the same review process as code changes.
+
+---
+
+## 7. Best Practices — Synthesized From the Ecosystem
+
+### NLP / AI Layer Best Practices
+
+| Practice | Why |
+|---|---|
+| **Confirm before execute** | Show parsed plan, get user approval. Prevents trust destruction from bad edits. Gives you a natural undo hook. |
+| **Dry-run mode** | Validate the JSON operation schema before running any model. Catch parameter errors before spending GPU |
+| **Model version pinning** | Freeze model versions in worker containers. Never use `latest` tag in production. |
+| **~200 named operations** | Don't let the LLM freestyle — restrict to a schema. Every operation in the registry is tested, bounded, undoable. |
+
+### Video / Media Pipeline Best Practices
+
+| Practice | Why |
+|---|---|
+| **Proxy editing always** | 480p for edit → full-res for export. This is industry standard. Premiere Pro, DaVinci. Never skip this. |
+| **Non-destructive DAG** | Never mutate original media. Store operations as a graph. Every node is revertible. |
+| **Keyframe anchoring** | AI edits on keyframes only → RIFE interpolation. Reduces GPU cost 10x, eliminates flicker. |
+| **Server-side export only** | Browser can preview (WebCodecs). Final export must go to FFmpeg server worker. Never trust browser for production output. |
+
+### Desktop / Cross-Platform Best Practices
+
+| Practice | Why |
+|---|---|
+| **CI/CD from day 1** | Windows + Mac + Linux runners. Adding a platform later breaks everything due to native dependency hell. |
+| **Code signing from day 1** | Apple notarization + Microsoft EV cert. Without this, users get "untrusted developer" warnings. Takes 2–4 weeks to set up. |
+| **Shared React codebase** | Web app and Tauri desktop share the same frontend. Tauri just wraps it with IPC bridges for native features. |
+
+### Infrastructure Best Practices
+
+| Practice | Why |
+|---|---|
+| **Result caching** | `hash(clip + op + params)` → Redis cache. Saves 40–60% GPU cost. Same op on same clip = free. |
+| **Stateless workers** | Workers hold no state. All state in Redis/PostgreSQL. Can kill/restart/scale any worker pod at any time. |
+| **Tiered processing** | Cheap model for preview → expensive model for export. Never run expensive inference on a preview frame. |
+| **Spot instances** | 70% cheaper for batch export jobs. Handle preemption via Redis job checkpointing. |
+
+### Security & Privacy Best Practices
+
+| Practice | Why |
+|---|---|
+| **Ephemeral processing** | Delete media from server after job completes (configurable, default 24h). Required for GDPR. |
+| **E2E encryption option** | Enterprise clients need footage to stay encrypted end-to-end. |
+| **GDPR data controls** | Export all data, delete all data — user-facing settings. Required for EU users. |
+
+### Testing Best Practices (AI-Specific)
+
+| Practice | Why |
+|---|---|
+| **Golden set evals** | 100 reference outputs. Run SSIM + VMAF quality metrics on every model upgrade. |
+| **Shadow model testing** | New model runs in parallel on 5% of traffic before full rollout. |
+| **SSIM / VMAF metrics** | Measure video quality numerically. Human review doesn't scale. |
+
+---
+
+## 8. 12-Month Roadmap
+
+```mermaid
+gantt
+    title VIDE 12-Month Development Roadmap
+    dateFormat  YYYY-MM
+    section Phase 1 — Foundation
+    Go API Gateway + Auth           :2026-04, 2026-05
+    Basic Web UI Shell              :2026-04, 2026-05
+    FFmpeg Video Worker             :2026-04, 2026-05
+    NLP Intent Parser (GPT-4o)     :2026-04, 2026-05
+
+    section Phase 2 — Core Editing
+    Image AI Worker (SAM2 + LaMa)  :2026-05, 2026-07
+    Scene Detection (PySceneDetect):2026-05, 2026-07
+    Auto-cut + B-roll              :2026-05, 2026-07
+    Color Grading (LUT engine)     :2026-06, 2026-07
+    Timeline Editor (Drag+Drop)    :2026-05, 2026-07
+
+    section Phase 3 — Video AI
+    Video AI (style transfer)      :2026-07, 2026-09
+    Object Remove (SAM2 + LaMa vid):2026-07, 2026-09
+    Object Tracking                :2026-07, 2026-09
+    Audio AI (DeepFilterNet)       :2026-07, 2026-09
+    Noise remove + SFX gen         :2026-07, 2026-09
+
+    section Phase 4 — Audio AI
+    Audio AI (Music BG gen)        :2026-09, 2026-11
+    Loudness normalization (EBU)   :2026-09, 2026-10
+    Level automation               :2026-09, 2026-10
+
+    section Phase 5 — Desktop + Ship
+    Tauri Desktop App              :2026-10, 2026-12
+    Offline Mode (llama.cpp)       :2026-10, 2026-12
+    Public Launch                  :2026-12, 2026-12
+```
+
+### Phase 1 (Month 1–2): Foundation
+**Goal**: Deployed skeleton. No AI features yet. Everything else works.
+- [ ] Go API Gateway with JWT auth, rate limiting, Kong plugin
+- [ ] PostgreSQL schema: users, projects, clips, operations DAG
+- [ ] MinIO/S3 object store with chunked upload
+- [ ] Basic Next.js web UI: upload, project list, simple timeline
+- [ ] FFmpeg video worker: trim, split, merge, basic transitions
+- [ ] BullMQ job queue: job creation, worker polling, WebSocket progress
+- [ ] CI/CD: GitHub Actions → Docker build → deploy to cloud
+- [ ] NLP parser v0: GPT-4o → JSON operation graph (just trim/split/export for now)
+- **Milestone**: Text-to-video-edit demo. "Trim first 5 seconds. Export at 1080p." → works end-to-end.
+
+### Phase 2 (Month 3–4): Core Image Editing + Timeline UX
+**Goal**: Beta-worthy image editor. Full timeline drag-and-drop.
+- [ ] SAM2 integration: click to select object → mask generation
+- [ ] rembg background removal (image)
+- [ ] LaMa inpainting / object removal (image)
+- [ ] Real-ESRGAN upscaling (image and video frames)
+- [ ] React DnD Kit timeline editor with multi-track support
+- [ ] Scene detection (PySceneDetect + CLIP) + auto-cut suggestion
+- [ ] Color grading: LUT apply, brightness/contrast/saturation sliders
+- [ ] Proxy editing: 480p proxy generation on upload
+- **Milestone**: "Remove the background from this photo" + "apply LUT color grade" + full timeline editing.
+
+### Phase 3 (Month 5–6): Video AI Features
+**Goal**: First AI video editing features. Object removal from video. Style transfer.
+- [ ] SAM2 video object tracking (propagate masks across frames)
+- [ ] LaMa inpainting on video frames (object removal from video)
+- [ ] AnyV2V-style temporal consistency: first-frame edit → I2V propagation
+- [ ] RIFE frame interpolation for smooth temporal transitions
+- [ ] DeepFilterNet audio denoising (auto-run on every upload)
+- [ ] Whisper transcription + subtitle generation
+- [ ] Audio EQ (librosa + pedalboard effects chain)
+- **Milestone**: "Remove the car from this video" works. "Add reverb to the voiceover" works.
+
+### Phase 4 (Month 7–9): Audio AI + Advanced Features
+**Goal**: Full audio pipeline. B-roll automation. Sound design.
+- [ ] MusicGen background music generation from text description
+- [ ] AudioLDM2 sound effects generation
+- [ ] EBU R128 loudness normalization (broadcast standard)
+- [ ] pyloudnorm level automation
+- [ ] B-roll auto-placement from transcript (CLIP embeddings on footage library)
+- [ ] Qdrant vector DB for semantic clip search
+- [ ] Batch export with tiered GPU workers (cheap preview → expensive export)
+- [ ] GPU result caching (Redis hash → lookup before running inference)
+- **Milestone**: Full video + audio AI pipeline. B-roll auto-placement from transcript.
+
+### Phase 5 (Month 10–12): Desktop App + Public Launch
+**Goal**: Tauri desktop app. Offline mode. Public beta. v1.0 launch.
+- [ ] Tauri 2.0 desktop app (Windows + macOS + Linux CI)
+- [ ] Local llama.cpp NLP planner (Mistral 7B, 4-bit quantized)
+- [ ] Local SAM2-small for offline object segmentation
+- [ ] Native file system access via Tauri IPC
+- [ ] Code signing (Apple notarization + Microsoft EV cert)
+- [ ] GDPR data controls (export/delete user data)
+- [ ] Prometheus + Grafana monitoring
+- [ ] Public beta → gather feedback → v1.0
+- **Milestone**: Ship v1.0 with full web + desktop app. Offline mode working.
+
+---
+
+## 9. Team Composition
+
+**Honest Timeline Assessment**: This is realistically a 3-engineer team for 12 months OR a 5-engineer team for 6–7 months.
+
+| Role | Responsibilities | Required Skills |
+|---|---|---|
+| **ML Engineer** | All AI model integration, Python workers, GPU optimization, model evaluation | Python, PyTorch, CUDA, FFmpeg, production ML |
+| **Backend Engineer** | Go gateway, PostgreSQL schema, BullMQ/Kafka, distributed systems, APIs | Go, PostgreSQL, Redis, Docker, Kubernetes |
+| **Frontend Engineer** | React 19 timeline editor, Next.js, WebSocket, UI/UX, Tauri IPC | React, TypeScript, WebSocket, WebCodecs, Rust basics |
+| *(optional 4th)* **Systems Engineer** | Tauri/Rust native features, FFmpeg pipeline optimization, media codecs | Rust, FFmpeg internals, native video codecs |
+| *(optional 5th)* **DevOps/SRE** | CI/CD, GPU cluster management, Kubernetes, monitoring | Kubernetes, Terraform, GPU node management |
+
+**The hardest parts** (allocate most senior engineers):
+1. NLP-to-operation parser — getting it reliable enough that users trust it
+2. Real-time preview system for video edits (low-latency proxy streaming)
+3. Temporal consistency for AI edits (AnyV2V pipeline)
+4. Cross-platform desktop packaging (tons of native dependency issues)
+
+---
+
+## 10. Key GitHub Repos Reference List
+
+| Repo | Purpose | Stars |
+|---|---|---|
+| `RayVentura/ShortGPT` | Steal operation schema concept | ~6k |
+| `timothybrooks/instruct-pix2pix` | Image editing from NL instructions | ~8k |
+| `arthur-71/Grounded-Instruct-Pix2Pix` | Grounded masking + IP2P | ~500 |
+| `TIGER-AI-Lab/AnyV2V` | Temporal consistency via first-frame anchor | ~1.5k |
+| `facebookresearch/segment-anything-2` | SAM2 object tracking | ~12k |
+| `remotion-dev/remotion` | React video timeline component inspiration | ~19k |
+| `mifi/editly` | JSON declarative video spec | ~4k |
+| `xinntao/Real-ESRGAN` | Video/image upscaling | ~26k |
+| `advimman/lama` | Inpainting / object removal | ~7k |
+| `danielgatis/rembg` | Background removal | ~14k |
+| `rikorose/DeepFilterNet` | Audio noise removal | ~5k |
+| `openai/whisper` | Speech recognition / subtitles | ~65k |
+| `facebookresearch/audiocraft` | MusicGen + AudioLDM | ~20k |
+| `spotify/pedalboard` | Professional audio effects | ~5k |
+| `taskforce-sh/bullmq` | Job queue | ~5k |
+| `tauri-apps/tauri` | Desktop app framework | ~80k |
+| `ggerganov/llama.cpp` | Local LLM inference | ~65k |
+| `hkchengrex/RIFE` | Frame interpolation for temporal smoothing | ~3k |
+
+---
+
+*Document last updated: March 2026. This is a living reference — update as architecture evolves.*

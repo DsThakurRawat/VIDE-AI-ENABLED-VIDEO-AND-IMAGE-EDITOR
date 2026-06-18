@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+.next/
+dist/
+out/
+build/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+gateway/vide-gateway
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+
+# Media
+*.mp4
+*.mov
+*.avi
+*.webm
+*.mkv
+*.wav
+*.mp3
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Rust/WASM
+target/
+wasm-renderer/pkg/
